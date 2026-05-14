@@ -32,11 +32,12 @@ const DEFAULTS = {
 };
 
 const STORAGE_KEYS = {
-  config:     'cwr-config',
-  roster:     'cwr-roster',
-  subs:       'cwr-submissions',
-  accounts:   'cwr-accounts',
-  facilities: 'cwr-facilities',
+  config:         'cwr-config',
+  roster:         'cwr-roster',
+  subs:           'cwr-submissions',
+  accounts:       'cwr-accounts',
+  facilities:     'cwr-facilities',
+  clinicalGroups: 'cwr-clinical-groups',
 };
 
 // Local-only (per-browser) storage keys — used for faculty draft & identity
@@ -143,6 +144,7 @@ export default function App() {
   const [submissions, setSubmissions] = useState([]);
   const [accounts, setAccounts] = useState([]);      // [{ id, email, passwordHash, name, createdAt, disabled }]
   const [facilities, setFacilities] = useState([]);  // [{ id, name }]
+  const [clinicalGroups, setClinicalGroups] = useState([]); // [{ id, cohortId, name, courseId, facility, facultyIds, studentIds }]
   const [toast, setToast] = useState(null);
 
   // Load
@@ -158,6 +160,8 @@ export default function App() {
       if (a) setAccounts(a);
       const f = await safeGet(STORAGE_KEYS.facilities);
       if (f) setFacilities(f);
+      const cg = await safeGet(STORAGE_KEYS.clinicalGroups);
+      if (cg) setClinicalGroups(cg);
 
       // Try to restore faculty session from localStorage
       const sessionId = safeLocal.get(LOCAL_KEYS.session);
@@ -179,6 +183,7 @@ export default function App() {
   const persistSubs       = async (next) => { setSubmissions(next); await safeSet(STORAGE_KEYS.subs, next); };
   const persistAccounts   = async (next) => { setAccounts(next); await safeSet(STORAGE_KEYS.accounts, next); };
   const persistFacilities = async (next) => { setFacilities(next); await safeSet(STORAGE_KEYS.facilities, next); };
+  const persistClinicalGroups = async (next) => { setClinicalGroups(next); await safeSet(STORAGE_KEYS.clinicalGroups, next); };
 
   const signInFaculty = (account) => {
     safeLocal.set(LOCAL_KEYS.session, account.id);
@@ -208,6 +213,7 @@ export default function App() {
           submissions={submissions} setSubmissions={persistSubs}
           accounts={accounts} setAccounts={persistAccounts}
           facilities={facilities} setFacilities={persistFacilities}
+          clinicalGroups={clinicalGroups} setClinicalGroups={persistClinicalGroups}
           onLogout={signOut}
           showToast={showToast}
         />
@@ -218,6 +224,7 @@ export default function App() {
           cohorts={cohorts} students={students}
           submissions={submissions} setSubmissions={persistSubs}
           facilities={facilities}
+          clinicalGroups={clinicalGroups}
           onLogout={signOut}
           showToast={showToast}
         />
@@ -837,12 +844,21 @@ function FieldLabel({ children }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Faculty form
 // ──────────────────────────────────────────────────────────────────────────────
-function FacultyApp({ account, accounts, setAccounts, cohorts, students, submissions, setSubmissions, facilities, onLogout, showToast }) {
+function FacultyApp({ account, accounts, setAccounts, cohorts, students, submissions, setSubmissions, facilities, clinicalGroups, onLogout, showToast }) {
   const [view, setView] = useState('form');     // 'form' | 'my-subs' | 'success'
   const [lastRef, setLastRef] = useState('');
   const [viewingSub, setViewingSub] = useState(null);
+  const [editingSub, setEditingSub] = useState(null);   // when set, form is in edit mode
+  const [lastWasEdit, setLastWasEdit] = useState(false);
   const [draftRestored, setDraftRestored] = useState(false);
   const [draftSavedFlash, setDraftSavedFlash] = useState(false);
+
+  // Clinical groups this faculty is assigned to
+  const myGroups = useMemo(
+    () => clinicalGroups.filter(g => g.facultyIds?.includes(account.accountId)),
+    [clinicalGroups, account.accountId]
+  );
+  const hasAssignments = myGroups.length > 0;
 
   // Compute prefill from this faculty's most recent submission
   const lastMine = useMemo(() => {
@@ -854,22 +870,28 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
 
   const todayISO = () => new Date().toISOString().slice(0, 10);
 
-  const emptyData = () => ({
-    courseId: lastMine?.courseId || '',
-    program:  lastMine?.program  || '',
-    cohortId: lastMine?.cohortId || '',
-    facultyName: account.name,
-    facility: safeLocal.get(LOCAL_KEYS.facility) || lastMine?.facility || '',
-    rotationDate: todayISO(),
-    facultyPresent: '',
-    supervisorNotified: '',
-    absentStudentIds: [],
-    absencesNotified: {},
-    remediationStudentIds: [],
-    remediationNotesByStudent: {},
-    remediationNotes: '',
-    absenceNotes: '',
-  });
+  const emptyData = () => {
+    // If faculty has assignments, prefill from their group(s)
+    const onlyGroup = myGroups.length === 1 ? myGroups[0] : null;
+    const groupCohort = onlyGroup ? cohorts.find(c => c.id === onlyGroup.cohortId) : null;
+    return {
+      groupId:  onlyGroup?.id || '',
+      courseId: onlyGroup?.courseId || lastMine?.courseId || '',
+      program:  groupCohort?.program || lastMine?.program  || '',
+      cohortId: onlyGroup?.cohortId || lastMine?.cohortId || '',
+      facultyName: account.name,
+      facility: onlyGroup?.facility || safeLocal.get(LOCAL_KEYS.facility) || lastMine?.facility || '',
+      rotationDate: todayISO(),
+      facultyPresent: '',
+      supervisorNotified: '',
+      absentStudentIds: [],
+      absencesNotified: {},
+      remediationStudentIds: [],
+      remediationNotesByStudent: {},
+      remediationNotes: '',
+      absenceNotes: '',
+    };
+  };
 
   const [data, setData] = useState(() => {
     const stored = safeLocal.get(LOCAL_KEYS.draft);
@@ -896,9 +918,9 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Autosave to localStorage
+  // Autosave to localStorage (drafts only — never overwrite while editing an existing submission)
   useEffect(() => {
-    if (view !== 'form') return;
+    if (view !== 'form' || editingSub) return;
     const t = setTimeout(() => {
       try {
         safeLocal.set(LOCAL_KEYS.draft, JSON.stringify(data));
@@ -907,7 +929,7 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
       } catch {}
     }, 600);
     return () => clearTimeout(t);
-  }, [data, view]);
+  }, [data, view, editingSub]);
 
   // Remember chosen facility
   useEffect(() => {
@@ -921,11 +943,21 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
     [cohorts, data.program]
   );
 
-  const rosterStudents = useMemo(
-    () => students.filter(s => s.cohortId === data.cohortId)
-                  .sort((a, b) => a.name.localeCompare(b.name)),
-    [students, data.cohortId]
+  // Selected clinical group (if any)
+  const selectedGroup = useMemo(
+    () => data.groupId ? clinicalGroups.find(g => g.id === data.groupId) : null,
+    [clinicalGroups, data.groupId]
   );
+
+  const rosterStudents = useMemo(() => {
+    let base = students.filter(s => s.cohortId === data.cohortId);
+    // If group has explicit studentIds, narrow to those
+    if (selectedGroup && selectedGroup.studentIds && selectedGroup.studentIds.length > 0) {
+      const allowed = new Set(selectedGroup.studentIds);
+      base = base.filter(s => allowed.has(s.id));
+    }
+    return base.sort((a, b) => a.name.localeCompare(b.name));
+  }, [students, data.cohortId, selectedGroup]);
 
   const canSubmit = data.courseId && data.program && data.cohortId &&
                     data.facultyName.trim() && data.facility.trim() &&
@@ -940,18 +972,61 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
-    const sub = {
-      id: uid(),
-      submittedAt: new Date().toISOString(),
-      accountId: account.accountId,
-      ...data,
-    };
-    const next = [sub, ...submissions];
-    await setSubmissions(next);
-    safeLocal.del(LOCAL_KEYS.draft);
-    setLastRef(sub.id.slice(0, 8).toUpperCase());
-    setView('success');
-    showToast('Report submitted successfully');
+    if (editingSub) {
+      // Update existing submission in place
+      const updated = {
+        ...editingSub,
+        ...data,
+        editedAt: new Date().toISOString(),
+        editedBy: account.accountId,
+      };
+      const next = submissions.map(s => s.id === editingSub.id ? updated : s);
+      await setSubmissions(next);
+      setLastRef(updated.id.slice(0, 8).toUpperCase());
+      setLastWasEdit(true);
+      setEditingSub(null);
+      setView('success');
+      showToast('Submission updated');
+    } else {
+      // New submission
+      const sub = {
+        id: uid(),
+        submittedAt: new Date().toISOString(),
+        accountId: account.accountId,
+        ...data,
+      };
+      const next = [sub, ...submissions];
+      await setSubmissions(next);
+      safeLocal.del(LOCAL_KEYS.draft);
+      setLastRef(sub.id.slice(0, 8).toUpperCase());
+      setLastWasEdit(false);
+      setView('success');
+      showToast('Report submitted successfully');
+    }
+  };
+
+  const enterEditMode = (sub) => {
+    setEditingSub(sub);
+    setData({ ...sub });
+    setViewingSub(null);
+    setView('form');
+    setDraftRestored(false);
+    // Scroll to top of form
+    if (typeof window !== 'undefined') window.scrollTo({ top: 0, behavior: 'auto' });
+  };
+
+  const cancelEditing = () => {
+    if (!confirm('Discard your changes and go back?')) return;
+    setEditingSub(null);
+    // Restore any draft that was in progress before they opened the editor
+    const stored = safeLocal.get(LOCAL_KEYS.draft);
+    if (stored) {
+      try { setData({ ...emptyData(), ...JSON.parse(stored), facultyName: account.name }); }
+      catch { setData(emptyData()); }
+    } else {
+      setData(emptyData());
+    }
+    setView('my-subs');
   };
 
   const startFresh = () => {
@@ -964,6 +1039,7 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
 
   if (view === 'success') {
     return <SuccessScreen refId={lastRef}
+                          wasEdit={lastWasEdit}
                           onAnother={() => {
                             setData({ ...emptyData(), facility: data.facility });
                             setView('form');
@@ -982,6 +1058,7 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
               viewingSub={viewingSub}
               setViewingSub={setViewingSub}
               onBack={() => { setViewingSub(null); setView('form'); }}
+              onEdit={enterEditMode}
               onLogout={onLogout}
             />;
   }
@@ -1005,18 +1082,40 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
                     gap: 12, marginBottom: 24, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', gap: 4, padding: 4, background: C.paperAlt,
                       borderRadius: 10, width: 'fit-content' }}>
-          <TabBtn active icon={<FileText size={16} />} label="New report" />
+          <TabBtn active icon={<FileText size={16} />} label={editingSub ? 'Editing report' : 'New report'} />
           <TabBtn icon={<History size={16} />} label="My submissions"
                   count={mySubmissions.length}
-                  onClick={() => setView('my-subs')} />
+                  onClick={() => editingSub ? cancelEditing() : setView('my-subs')} />
         </div>
-        <button onClick={() => setView('change-password')} className="cwr-btn-ghost"
-                style={{ padding: '8px 12px', fontSize: 13 }}>
-          <KeyRound size={14} /> Change password
-        </button>
+        {!editingSub && (
+          <button onClick={() => setView('change-password')} className="cwr-btn-ghost"
+                  style={{ padding: '8px 12px', fontSize: 13 }}>
+            <KeyRound size={14} /> Change password
+          </button>
+        )}
       </div>
 
-      {draftRestored && (
+      {editingSub && (
+        <div className="cwr-fade-in" style={{
+          padding: '12px 16px', marginBottom: 24,
+          background: C.amber + '15', border: `1px solid ${C.amber}55`,
+          borderRadius: 10, display: 'flex', alignItems: 'center',
+          justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', fontSize: 13,
+        }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#7a5a18' }}>
+            <AlertCircle size={14} />
+            Editing your submission from <strong>{fmtDate(editingSub.rotationDate)}</strong>.
+            Your changes will replace the original.
+          </span>
+          <button onClick={cancelEditing}
+                  style={{ color: '#7a5a18', fontSize: 13, fontWeight: 500, padding: 4,
+                           textDecoration: 'underline', textUnderlineOffset: 3 }}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {draftRestored && !editingSub && (
         <div className="cwr-fade-in" style={{
           padding: '12px 16px', marginBottom: 24,
           background: C.forest + '12', border: `1px solid ${C.forest}44`,
@@ -1054,42 +1153,85 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
         )}
       </div>
 
-      <Section number="1" title="Clinical course">
-        <RadioGroup
-          options={COURSES.map(c => ({ value: c.id, label: `${c.name}`, sub: c.code }))}
-          value={data.courseId}
-          onChange={v => update({ courseId: v })}
-        />
-      </Section>
+      {hasAssignments ? (
+        <Section number="1" title="Your clinical group"
+                 hint={myGroups.length === 1
+                   ? "You're assigned to one clinical group. It's pre-selected for you."
+                   : `You're assigned to ${myGroups.length} groups — pick the one this report is for.`}>
+          <div className="cwr-radio-row">
+            {myGroups.map(g => {
+              const groupCohort = cohorts.find(c => c.id === g.cohortId);
+              const course = COURSES.find(c => c.id === g.courseId);
+              const studentCount = g.studentIds?.length
+                || students.filter(s => s.cohortId === g.cohortId).length;
+              const selected = data.groupId === g.id;
+              return (
+                <label key={g.id} className={'cwr-radio' + (selected ? ' selected' : '')}>
+                  <input type="radio" checked={selected}
+                         onChange={() => update({
+                           groupId: g.id,
+                           courseId: g.courseId,
+                           program: groupCohort?.program || '',
+                           cohortId: g.cohortId,
+                           facility: g.facility || data.facility,
+                           absentStudentIds: [],
+                           absencesNotified: {},
+                           remediationStudentIds: [],
+                           remediationNotesByStudent: {},
+                         })} />
+                  <span style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+                    <span style={{ fontWeight: 500 }}>{g.name}</span>
+                    <span style={{ fontSize: 12, color: C.inkFaint, marginTop: 2 }}>
+                      {course?.name || 'Course'} · {groupCohort?.name || 'Cohort'}
+                      {g.facility ? ` · ${g.facility}` : ''}
+                      {' · '}{studentCount} student{studentCount === 1 ? '' : 's'}
+                    </span>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </Section>
+      ) : (
+        <>
+          <Section number="1" title="Clinical course">
+            <RadioGroup
+              options={COURSES.map(c => ({ value: c.id, label: `${c.name}`, sub: c.code }))}
+              value={data.courseId}
+              onChange={v => update({ courseId: v })}
+            />
+          </Section>
 
-      <Section number="2" title="Program">
-        <RadioGroup
-          options={PROGRAMS.map(p => ({ value: p.id, label: p.label }))}
-          value={data.program}
-          onChange={v => update({ program: v, cohortId: '' })}
-        />
-      </Section>
+          <Section number="2" title="Program">
+            <RadioGroup
+              options={PROGRAMS.map(p => ({ value: p.id, label: p.label }))}
+              value={data.program}
+              onChange={v => update({ program: v, cohortId: '' })}
+            />
+          </Section>
 
-      <Section number="3" title="Cohort"
-               hint={!data.program ? 'Select a program first.' :
-                     availableCohorts.length === 0 ? 'No cohorts available for this program — ask your administrator to create one.' : null}>
-        {data.program && availableCohorts.length > 0 && (
-          <RadioGroup
-            options={availableCohorts.map(c => ({ value: c.id, label: c.name,
-              sub: `${students.filter(s => s.cohortId === c.id).length} students` }))}
-            value={data.cohortId}
-            onChange={v => update({ cohortId: v, absentStudentIds: [], absencesNotified: {}, remediationStudentIds: [], remediationNotesByStudent: {} })}
-          />
-        )}
-      </Section>
+          <Section number="3" title="Cohort"
+                   hint={!data.program ? 'Select a program first.' :
+                         availableCohorts.length === 0 ? 'No cohorts available for this program — ask your administrator to create one.' : null}>
+            {data.program && availableCohorts.length > 0 && (
+              <RadioGroup
+                options={availableCohorts.map(c => ({ value: c.id, label: c.name,
+                  sub: `${students.filter(s => s.cohortId === c.id).length} students` }))}
+                value={data.cohortId}
+                onChange={v => update({ cohortId: v, absentStudentIds: [], absencesNotified: {}, remediationStudentIds: [], remediationNotesByStudent: {} })}
+              />
+            )}
+          </Section>
+        </>
+      )}
 
-      <Section number="4" title="Your name"
+      <Section number={hasAssignments ? "2" : "4"} title="Your name"
                hint="Pulled from your account.">
         <input className="cwr-input" value={data.facultyName} readOnly disabled
                style={{ background: C.paperAlt, cursor: 'not-allowed' }} />
       </Section>
 
-      <Section number="5" title="Facility name"
+      <Section number={hasAssignments ? "3" : "5"} title="Facility name"
                hint={facilities.length === 0
                  ? "Type the facility where this rotation took place."
                  : "Pick from the list or type a new one."}>
@@ -1121,14 +1263,14 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
         )}
       </Section>
 
-      <Section number="6" title="Clinical rotation date">
+      <Section number={hasAssignments ? "4" : "6"} title="Clinical rotation date">
         <input type="date" className="cwr-input" value={data.rotationDate}
                onChange={e => update({ rotationDate: e.target.value })}
                max={new Date().toISOString().slice(0, 10)}
                style={{ maxWidth: 260 }} />
       </Section>
 
-      <Section number="7" title="Were you (as faculty member) present for this clinical rotation?"
+      <Section number={hasAssignments ? "5" : "7"} title="Were you (as faculty member) present for this clinical rotation?"
                hint="If you were absent, confirm that you notified your supervisor and the Clinical Placement Office.">
         <RadioGroup
           options={[
@@ -1153,7 +1295,7 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
         )}
       </Section>
 
-      <Section number="8" title="Student absences"
+      <Section number={hasAssignments ? "6" : "8"} title="Student absences"
                hint="Check off any students who were absent this rotation. For each, note whether they notified you in advance.">
         {!data.cohortId ? (
           <EmptyHint>Select a cohort to load the roster.</EmptyHint>
@@ -1203,7 +1345,7 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
         )}
       </Section>
 
-      <Section number="9" title="Students requiring remediation"
+      <Section number={hasAssignments ? "7" : "9"} title="Students requiring remediation"
                hint="Check any students who are deficient and require remediation. Add a note for each student explaining the deficiency and plan. Ensure a learning contract is established and emailed within 24 hours.">
         {!data.cohortId ? (
           <EmptyHint>Select a cohort to load the roster.</EmptyHint>
@@ -1262,18 +1404,29 @@ function FacultyApp({ account, accounts, setAccounts, cohorts, students, submiss
       <div style={{ marginTop: 40, padding: 20, background: C.paperAlt, borderRadius: 12,
                     display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
         <div style={{ fontSize: 13, color: C.inkSoft, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-          <span>{canSubmit ? 'Review your responses, then submit.' : 'Complete the required fields to submit.'}</span>
-          <span style={{
-            display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12,
-            color: draftSavedFlash ? C.forest : C.inkFaint,
-            transition: 'color .3s',
-          }}>
-            <Check size={12} /> Draft saved
-          </span>
+          <span>{editingSub
+            ? (canSubmit ? 'Review your changes, then save.' : 'Complete required fields to save.')
+            : (canSubmit ? 'Review your responses, then submit.' : 'Complete the required fields to submit.')}</span>
+          {!editingSub && (
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12,
+              color: draftSavedFlash ? C.forest : C.inkFaint,
+              transition: 'color .3s',
+            }}>
+              <Check size={12} /> Draft saved
+            </span>
+          )}
         </div>
-        <button onClick={handleSubmit} disabled={!canSubmit} className="cwr-btn-primary">
-          <Save size={16} /> Submit report
-        </button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          {editingSub && (
+            <button onClick={cancelEditing} className="cwr-btn-ghost">
+              Cancel
+            </button>
+          )}
+          <button onClick={handleSubmit} disabled={!canSubmit} className="cwr-btn-primary">
+            <Save size={16} /> {editingSub ? 'Save changes' : 'Submit report'}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1343,7 +1496,7 @@ function EmptyHint({ children }) {
   );
 }
 
-function SuccessScreen({ refId, onAnother, onViewMySubs, mySubsCount, onLogout }) {
+function SuccessScreen({ refId, wasEdit, onAnother, onViewMySubs, mySubsCount, onLogout }) {
   return (
     <div style={{ display: 'grid', placeItems: 'center', minHeight: '100vh', padding: 24 }}>
       <div className="cwr-fade-in" style={{ width: '100%', maxWidth: 480, textAlign: 'center' }}>
@@ -1353,17 +1506,20 @@ function SuccessScreen({ refId, onAnother, onViewMySubs, mySubsCount, onLogout }
           <CheckCircle2 size={32} />
         </div>
         <h1 className="cwr-display" style={{ fontSize: 32, margin: 0 }}>
-          Report <span className="cwr-italic">submitted</span>
+          {wasEdit ? <>Submission <span className="cwr-italic">updated</span></>
+                   : <>Report <span className="cwr-italic">submitted</span></>}
         </h1>
         <p style={{ color: C.inkSoft, marginTop: 12 }}>
-          Thank you. Your weekly clinical report has been recorded and is available to your program administrators.
+          {wasEdit
+            ? 'Your changes have been saved. Your administrators will see the updated submission.'
+            : 'Thank you. Your weekly clinical report has been recorded and is available to your program administrators.'}
         </p>
         <div className="cwr-chip" style={{ marginTop: 16 }}>
           <Sparkles size={12} /> Reference: <span className="cwr-mono" style={{ marginLeft: 4 }}>{refId}</span>
         </div>
         <div style={{ display: 'flex', gap: 10, justifyContent: 'center', marginTop: 28, flexWrap: 'wrap' }}>
           <button onClick={onAnother} className="cwr-btn-primary">
-            <Plus size={16} /> Submit another
+            <Plus size={16} /> {wasEdit ? 'New report' : 'Submit another'}
           </button>
           {onViewMySubs && (
             <button onClick={onViewMySubs} className="cwr-btn-ghost">
@@ -1382,7 +1538,7 @@ function SuccessScreen({ refId, onAnother, onViewMySubs, mySubsCount, onLogout }
 // ──────────────────────────────────────────────────────────────────────────────
 // Faculty "My submissions" view
 // ──────────────────────────────────────────────────────────────────────────────
-function MySubmissionsView({ submissions, students, cohorts, identity, viewingSub, setViewingSub, onBack, onLogout }) {
+function MySubmissionsView({ submissions, students, cohorts, identity, viewingSub, setViewingSub, onBack, onEdit, onLogout }) {
   if (viewingSub) {
     return (
       <div style={{ maxWidth: 760, margin: '0 auto', padding: '32px 24px 80px' }}>
@@ -1392,6 +1548,7 @@ function MySubmissionsView({ submissions, students, cohorts, identity, viewingSu
           students={students}
           cohorts={cohorts}
           onBack={() => setViewingSub(null)}
+          onEdit={() => onEdit(viewingSub)}
           readOnly
           backLabel="Back to my submissions"
         />
@@ -1590,7 +1747,7 @@ function Header({ onLogout, subtitle }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Admin app
 // ──────────────────────────────────────────────────────────────────────────────
-function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions, setSubmissions, accounts, setAccounts, facilities, setFacilities, onLogout, showToast }) {
+function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions, setSubmissions, accounts, setAccounts, facilities, setFacilities, clinicalGroups, setClinicalGroups, onLogout, showToast }) {
   const [tab, setTab] = useState('submissions');
 
   return (
@@ -1616,7 +1773,10 @@ function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions
                           cohorts={cohorts} students={students} showToast={showToast} />
       )}
       {tab === 'rosters' && (
-        <RostersPanel cohorts={cohorts} students={students} setRoster={setRoster} showToast={showToast} />
+        <RostersPanel cohorts={cohorts} students={students} setRoster={setRoster}
+                      clinicalGroups={clinicalGroups} setClinicalGroups={setClinicalGroups}
+                      facilities={facilities} accounts={accounts}
+                      showToast={showToast} />
       )}
       {tab === 'faculty' && (
         <FacultyAccountsPanel accounts={accounts} setAccounts={setAccounts}
@@ -1983,7 +2143,7 @@ function SubmissionsPanel({ submissions, setSubmissions, cohorts, students, show
   );
 }
 
-function SubmissionDetail({ sub, students, cohorts, onBack, onSave, onDelete, readOnly = false, backLabel = 'Back to all submissions' }) {
+function SubmissionDetail({ sub, students, cohorts, onBack, onSave, onDelete, onEdit, readOnly = false, backLabel = 'Back to all submissions' }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(sub);
   const studentMap = Object.fromEntries(students.map(s => [s.id, s.name]));
@@ -2025,6 +2185,11 @@ function SubmissionDetail({ sub, students, cohorts, onBack, onSave, onDelete, re
             <div style={{ color: C.inkFaint, fontSize: 13, marginTop: 4 }}>
               Submitted {fmtDateTime(sub.submittedAt)} · Ref <span className="cwr-mono">{sub.id.slice(0,8).toUpperCase()}</span>
             </div>
+            {sub.editedAt && (
+              <div style={{ color: C.inkFaint, fontSize: 12, marginTop: 2, fontStyle: 'italic' }}>
+                Edited {fmtRelative(sub.editedAt)}
+              </div>
+            )}
           </div>
           <div className="cwr-no-print" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {!editing ? (
@@ -2032,6 +2197,11 @@ function SubmissionDetail({ sub, students, cohorts, onBack, onSave, onDelete, re
                 <button onClick={() => window.print()} className="cwr-btn-ghost">
                   <Printer size={14} /> Print / PDF
                 </button>
+                {onEdit && (
+                  <button onClick={onEdit} className="cwr-btn-primary">
+                    <FileText size={14} /> Edit submission
+                  </button>
+                )}
                 {!readOnly && (
                   <>
                     <button onClick={() => { setDraft(sub); setEditing(true); }} className="cwr-btn-ghost">
@@ -2180,7 +2350,7 @@ function SubmissionDetail({ sub, students, cohorts, onBack, onSave, onDelete, re
 // ──────────────────────────────────────────────────────────────────────────────
 // Rosters panel
 // ──────────────────────────────────────────────────────────────────────────────
-function RostersPanel({ cohorts, students, setRoster, showToast }) {
+function RostersPanel({ cohorts, students, setRoster, clinicalGroups, setClinicalGroups, facilities, accounts, showToast }) {
   const [selectedId, setSelectedId] = useState(null);
   const [creating, setCreating] = useState(false);
   const [newCohort, setNewCohort] = useState({ name: '', program: 'BSN' });
@@ -2200,8 +2370,11 @@ function RostersPanel({ cohorts, students, setRoster, showToast }) {
 
   const deleteCohort = async (id) => {
     const count = students.filter(s => s.cohortId === id).length;
-    if (!confirm(`Delete this cohort and its ${count} student${count === 1 ? '' : 's'}? This cannot be undone.`)) return;
+    const groupCount = clinicalGroups.filter(g => g.cohortId === id).length;
+    const extraNote = groupCount > 0 ? ` and ${groupCount} clinical group${groupCount === 1 ? '' : 's'}` : '';
+    if (!confirm(`Delete this cohort, its ${count} student${count === 1 ? '' : 's'}${extraNote}? This cannot be undone.`)) return;
     await setRoster(cohorts.filter(c => c.id !== id), students.filter(s => s.cohortId !== id));
+    if (groupCount > 0) await setClinicalGroups(clinicalGroups.filter(g => g.cohortId !== id));
     if (selectedId === id) setSelectedId(null);
     showToast('Cohort deleted');
   };
@@ -2274,6 +2447,8 @@ function RostersPanel({ cohorts, students, setRoster, showToast }) {
         ) : (
           <RosterEditor cohort={selected} students={cohortStudents}
                         allStudents={students} cohorts={cohorts} setRoster={setRoster}
+                        clinicalGroups={clinicalGroups} setClinicalGroups={setClinicalGroups}
+                        facilities={facilities} accounts={accounts}
                         onDeleteCohort={() => deleteCohort(selected.id)}
                         showToast={showToast} />
         )}
@@ -2282,10 +2457,12 @@ function RostersPanel({ cohorts, students, setRoster, showToast }) {
   );
 }
 
-function RosterEditor({ cohort, students: cohortStudents, allStudents, cohorts, setRoster, onDeleteCohort, showToast }) {
+function RosterEditor({ cohort, students: cohortStudents, allStudents, cohorts, setRoster, clinicalGroups, setClinicalGroups, facilities, accounts, onDeleteCohort, showToast }) {
   const [adding, setAdding] = useState('');
   const [bulk, setBulk] = useState('');
   const [bulkOpen, setBulkOpen] = useState(false);
+
+  const cohortGroups = clinicalGroups.filter(g => g.cohortId === cohort.id);
 
   const add = async () => {
     const name = adding.trim();
@@ -2326,6 +2503,7 @@ function RosterEditor({ cohort, students: cohortStudents, allStudents, cohorts, 
             <h2 className="cwr-display" style={{ fontSize: 24, margin: 0 }}>{cohort.name}</h2>
             <div style={{ color: C.inkFaint, fontSize: 13, marginTop: 4 }}>
               {programLabel(cohort.program)} · {cohortStudents.length} student{cohortStudents.length === 1 ? '' : 's'}
+              {cohortGroups.length > 0 && ` · ${cohortGroups.length} clinical group${cohortGroups.length === 1 ? '' : 's'}`}
             </div>
           </div>
           <button onClick={onDeleteCohort} className="cwr-btn-danger">
@@ -2379,6 +2557,322 @@ function RosterEditor({ cohort, students: cohortStudents, allStudents, cohorts, 
             ))}
           </div>
         )}
+      </div>
+
+      <ClinicalGroupsSection
+        cohort={cohort}
+        cohortStudents={cohortStudents}
+        clinicalGroups={clinicalGroups}
+        setClinicalGroups={setClinicalGroups}
+        facilities={facilities}
+        accounts={accounts}
+        showToast={showToast}
+      />
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Clinical groups section (lives inside the cohort detail view)
+// ──────────────────────────────────────────────────────────────────────────────
+function ClinicalGroupsSection({ cohort, cohortStudents, clinicalGroups, setClinicalGroups, facilities, accounts, showToast }) {
+  const [creating, setCreating] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+
+  const groups = clinicalGroups.filter(g => g.cohortId === cohort.id);
+
+  const emptyGroup = () => ({
+    id: '',
+    cohortId: cohort.id,
+    name: '',
+    courseId: '',
+    facility: '',
+    facultyIds: [],
+    studentIds: [],
+  });
+
+  const startCreate = () => {
+    setEditingId(null);
+    setCreating(true);
+  };
+
+  const startEdit = (id) => {
+    setCreating(false);
+    setEditingId(id);
+  };
+
+  const cancelForm = () => {
+    setCreating(false);
+    setEditingId(null);
+  };
+
+  const save = async (draft) => {
+    if (!draft.name.trim()) { showToast('Group needs a name', 'error'); return; }
+    if (!draft.courseId)    { showToast('Pick a clinical course', 'error'); return; }
+    let next;
+    if (draft.id) {
+      next = clinicalGroups.map(g => g.id === draft.id ? { ...draft } : g);
+      showToast('Group updated');
+    } else {
+      const created = { ...draft, id: 'cg_' + uid() };
+      next = [...clinicalGroups, created];
+      showToast('Group created');
+    }
+    await setClinicalGroups(next);
+    cancelForm();
+  };
+
+  const remove = async (id) => {
+    if (!confirm('Delete this clinical group? Faculty assigned to it will lose access (but submissions are kept).')) return;
+    await setClinicalGroups(clinicalGroups.filter(g => g.id !== id));
+    showToast('Group deleted');
+  };
+
+  return (
+    <div className="cwr-card" style={{ marginTop: 20 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end',
+                    gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+        <div>
+          <h3 className="cwr-display" style={{ fontSize: 20, margin: 0 }}>
+            Clinical <span className="cwr-italic">groups</span>
+          </h3>
+          <p style={{ fontSize: 13, color: C.inkSoft, marginTop: 4, marginBottom: 0 }}>
+            Optional. Split this cohort into clinical groups by course, facility, and assigned faculty.
+            Faculty assigned to a group will only see their group's students when filing reports.
+          </p>
+        </div>
+        {!creating && editingId === null && (
+          <button onClick={startCreate} className="cwr-btn-primary" style={{ padding: '8px 12px', fontSize: 13 }}>
+            <Plus size={14} /> New group
+          </button>
+        )}
+      </div>
+
+      {creating && (
+        <GroupEditor
+          initial={emptyGroup()}
+          cohortStudents={cohortStudents}
+          facilities={facilities}
+          accounts={accounts}
+          onSave={save}
+          onCancel={cancelForm}
+        />
+      )}
+
+      {!creating && groups.length === 0 && (
+        <div style={{ padding: 20, textAlign: 'center', color: C.inkFaint, fontStyle: 'italic',
+                      background: C.paper, borderRadius: 10 }}>
+          No clinical groups yet. Faculty will pick freely from the full cohort until you create at least one.
+        </div>
+      )}
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: groups.length > 0 ? 4 : 0 }}>
+        {groups.map(g => {
+          const isEditing = editingId === g.id;
+          return (
+            <div key={g.id} style={{
+              background: C.paper, borderRadius: 10, overflow: 'hidden',
+            }}>
+              {isEditing ? (
+                <GroupEditor
+                  initial={g}
+                  cohortStudents={cohortStudents}
+                  facilities={facilities}
+                  accounts={accounts}
+                  onSave={save}
+                  onCancel={cancelForm}
+                />
+              ) : (
+                <GroupRow group={g} accounts={accounts} cohortStudents={cohortStudents}
+                          onEdit={() => startEdit(g.id)}
+                          onDelete={() => remove(g.id)} />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function GroupRow({ group, accounts, cohortStudents, onEdit, onDelete }) {
+  const courseName = COURSES.find(c => c.id === group.courseId)?.name || '—';
+  const faculty = group.facultyIds.map(id => accounts.find(a => a.id === id)?.name || 'Removed').filter(Boolean);
+  const studentCount = group.studentIds?.length || 0;
+  const fallbackCount = cohortStudents.length;
+
+  return (
+    <div style={{ padding: '14px 16px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+      <div style={{ flex: 1, minWidth: 220 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 600 }}>{group.name}</span>
+          <span className="cwr-chip">{courseName}</span>
+          {group.facility && <span className="cwr-chip">{group.facility}</span>}
+        </div>
+        <div style={{ fontSize: 13, color: C.inkFaint, marginTop: 4 }}>
+          {faculty.length === 0
+            ? <span style={{ color: C.terra }}>No faculty assigned yet</span>
+            : `Faculty: ${faculty.join(', ')}`}
+          {' · '}
+          {studentCount > 0
+            ? `${studentCount} student${studentCount === 1 ? '' : 's'}`
+            : `All ${fallbackCount} cohort students`}
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 6 }}>
+        <button onClick={onEdit} className="cwr-btn-ghost" style={{ padding: '6px 10px', fontSize: 13 }}>
+          Edit
+        </button>
+        <button onClick={onDelete} className="cwr-btn-danger" style={{ padding: '6px 10px', fontSize: 13 }}>
+          <Trash2 size={13} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GroupEditor({ initial, cohortStudents, facilities, accounts, onSave, onCancel }) {
+  const [draft, setDraft] = useState(initial);
+  const [studentMode, setStudentMode] = useState(
+    (initial.studentIds?.length || 0) > 0 ? 'subset' : 'all'
+  );
+
+  const update = (patch) => setDraft(d => ({ ...d, ...patch }));
+
+  const toggleFaculty = (id) => {
+    const set = new Set(draft.facultyIds);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    update({ facultyIds: Array.from(set) });
+  };
+
+  const toggleStudent = (id) => {
+    const set = new Set(draft.studentIds || []);
+    if (set.has(id)) set.delete(id); else set.add(id);
+    update({ studentIds: Array.from(set) });
+  };
+
+  const handleSave = () => {
+    // If studentMode is 'all', clear studentIds so it falls back to whole cohort
+    const finalDraft = { ...draft, studentIds: studentMode === 'all' ? [] : (draft.studentIds || []) };
+    onSave(finalDraft);
+  };
+
+  const activeFaculty = accounts.filter(a => !a.disabled).sort((a, b) => a.name.localeCompare(b.name));
+
+  return (
+    <div className="cwr-fade-in" style={{ padding: 16, background: C.paper, borderRadius: 10 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12, marginBottom: 12 }}>
+        <div>
+          <FieldLabel>Group name</FieldLabel>
+          <input className="cwr-input" autoFocus value={draft.name}
+                 onChange={e => update({ name: e.target.value })}
+                 placeholder="e.g. Med-Surg Group A" />
+        </div>
+        <div>
+          <FieldLabel>Clinical course</FieldLabel>
+          <select className="cwr-input" value={draft.courseId}
+                  onChange={e => update({ courseId: e.target.value })}>
+            <option value="">Select a course…</option>
+            {COURSES.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+        <div>
+          <FieldLabel>Facility <span style={{ color: C.inkFaint, fontWeight: 400 }}>(optional)</span></FieldLabel>
+          {facilities.length > 0 ? (
+            <select className="cwr-input" value={draft.facility || ''}
+                    onChange={e => update({ facility: e.target.value })}>
+              <option value="">— Not specified —</option>
+              {facilities.map(f => <option key={f.id} value={f.name}>{f.name}</option>)}
+            </select>
+          ) : (
+            <input className="cwr-input" value={draft.facility || ''}
+                   onChange={e => update({ facility: e.target.value })}
+                   placeholder="e.g. St. Francis Medical Center" />
+          )}
+        </div>
+      </div>
+
+      <FieldLabel>Assigned faculty <span style={{ color: C.inkFaint, fontWeight: 400 }}>(one or more)</span></FieldLabel>
+      {activeFaculty.length === 0 ? (
+        <div style={{ padding: 12, fontSize: 13, color: C.inkFaint, fontStyle: 'italic',
+                      background: C.white, borderRadius: 8, marginBottom: 14 }}>
+          No active faculty accounts yet. Faculty must register before they can be assigned.
+        </div>
+      ) : (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 14 }}>
+          {activeFaculty.map(a => {
+            const picked = draft.facultyIds.includes(a.id);
+            return (
+              <button key={a.id} onClick={() => toggleFaculty(a.id)}
+                      style={{
+                        padding: '6px 12px', borderRadius: 999, fontSize: 13,
+                        background: picked ? C.forest : C.white,
+                        color: picked ? C.paper : C.inkSoft,
+                        border: `1px solid ${picked ? C.forest : C.line}`,
+                        transition: 'all .12s',
+                      }}>
+                {picked ? <Check size={12} style={{ marginRight: 4, verticalAlign: 'middle' }} /> : null}
+                {a.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <FieldLabel>Students in this group</FieldLabel>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+        <button onClick={() => setStudentMode('all')}
+                style={{
+                  padding: '6px 12px', borderRadius: 8, fontSize: 13,
+                  background: studentMode === 'all' ? C.ink : C.white,
+                  color: studentMode === 'all' ? C.paper : C.inkSoft,
+                  border: `1px solid ${studentMode === 'all' ? C.ink : C.line}`,
+                }}>
+          All cohort students
+        </button>
+        <button onClick={() => setStudentMode('subset')}
+                style={{
+                  padding: '6px 12px', borderRadius: 8, fontSize: 13,
+                  background: studentMode === 'subset' ? C.ink : C.white,
+                  color: studentMode === 'subset' ? C.paper : C.inkSoft,
+                  border: `1px solid ${studentMode === 'subset' ? C.ink : C.line}`,
+                }}>
+          Specific students…
+        </button>
+      </div>
+
+      {studentMode === 'subset' && (
+        cohortStudents.length === 0 ? (
+          <div style={{ padding: 12, fontSize: 13, color: C.inkFaint, fontStyle: 'italic',
+                        background: C.white, borderRadius: 8 }}>
+            Add students to the cohort first.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {cohortStudents.map(s => {
+              const picked = (draft.studentIds || []).includes(s.id);
+              return (
+                <button key={s.id} onClick={() => toggleStudent(s.id)}
+                        style={{
+                          padding: '6px 12px', borderRadius: 999, fontSize: 13,
+                          background: picked ? C.forest : C.white,
+                          color: picked ? C.paper : C.inkSoft,
+                          border: `1px solid ${picked ? C.forest : C.line}`,
+                        }}>
+                  {picked ? <Check size={12} style={{ marginRight: 4, verticalAlign: 'middle' }} /> : null}
+                  {s.name}
+                </button>
+              );
+            })}
+          </div>
+        )
+      )}
+
+      <div style={{ display: 'flex', gap: 6, marginTop: 16, justifyContent: 'flex-end' }}>
+        <button onClick={onCancel} className="cwr-btn-ghost">Cancel</button>
+        <button onClick={handleSave} className="cwr-btn-primary">
+          <Save size={14} /> {draft.id ? 'Save changes' : 'Create group'}
+        </button>
       </div>
     </div>
   );
