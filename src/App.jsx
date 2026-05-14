@@ -27,8 +27,22 @@ const PROGRAMS = [
 
 
 const DEFAULTS = {
-  adminPassword:   'admin2026',
-  facultyPassword: 'clinical2026',
+  adminPassword:       'admin2026',
+  facultyPassword:     'clinical2026',
+  legacyAdminEnabled:  true,    // shared admin password works until owner disables it
+};
+
+// Role helpers — accounts have role: 'faculty' | 'admin' | 'owner' (default 'faculty')
+const getRole = (a) => (a && a.role) || 'faculty';
+const isFaculty = (a) => a && getRole(a) === 'faculty';
+const isAdmin   = (a) => a && getRole(a) === 'admin';
+const isOwner   = (a) => a && getRole(a) === 'owner';
+const isStaff   = (a) => isAdmin(a) || isOwner(a);
+const roleLabel = (r) => ({ faculty: 'Faculty', admin: 'Administrator', owner: 'Owner' }[r] || 'Faculty');
+const roleColor = (r) => {
+  if (r === 'owner') return { bg: '#2d4a3e22', fg: '#1f3329', bd: '#2d4a3e44' };
+  if (r === 'admin') return { bg: '#c8964022', fg: '#7a5a18', bd: '#c8964055' };
+  return                   { bg: '#7a818922', fg: '#4a5159', bd: '#7a818933' };
 };
 
 const STORAGE_KEYS = {
@@ -119,7 +133,7 @@ const fmtRelative = (iso) => {
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Storage helpers — wrap storage in try/catch (missing keys throw)
+// Storage helpers — wrap window.storage in try/catch (missing keys throw)
 // ──────────────────────────────────────────────────────────────────────────────
 const safeGet = async (key) => {
   try {
@@ -137,14 +151,15 @@ const safeSet = async (key, value) => {
 // ──────────────────────────────────────────────────────────────────────────────
 export default function App() {
   const [booted, setBooted] = useState(false);
-  const [auth, setAuth] = useState(null);            // null | 'admin' | { type: 'faculty', accountId, name, email }
+  // auth: null | { accountId, name, email, role: 'faculty' | 'admin' | 'owner' }
+  const [auth, setAuth] = useState(null);
   const [config, setConfig] = useState(DEFAULTS);
   const [cohorts, setCohorts] = useState([]);
   const [students, setStudents] = useState([]);
   const [submissions, setSubmissions] = useState([]);
-  const [accounts, setAccounts] = useState([]);      // [{ id, email, passwordHash, name, createdAt, disabled }]
-  const [facilities, setFacilities] = useState([]);  // [{ id, name }]
-  const [clinicalGroups, setClinicalGroups] = useState([]); // [{ id, cohortId, name, courseId, facility, facultyIds, studentIds }]
+  const [accounts, setAccounts] = useState([]);
+  const [facilities, setFacilities] = useState([]);
+  const [clinicalGroups, setClinicalGroups] = useState([]);
   const [toast, setToast] = useState(null);
 
   // Load
@@ -157,18 +172,22 @@ export default function App() {
       const s = await safeGet(STORAGE_KEYS.subs);
       if (s) setSubmissions(s);
       const a = await safeGet(STORAGE_KEYS.accounts);
-      if (a) setAccounts(a);
+      if (a) {
+        // Migrate: ensure every account has a role
+        const migrated = a.map(x => x.role ? x : { ...x, role: 'faculty' });
+        setAccounts(migrated);
+        // Try to restore session
+        const sessionId = safeLocal.get(LOCAL_KEYS.session);
+        if (sessionId) {
+          const acc = migrated.find(x => x.id === sessionId && !x.disabled);
+          if (acc) setAuth({ accountId: acc.id, name: acc.name, email: acc.email, role: getRole(acc) });
+        }
+      }
       const f = await safeGet(STORAGE_KEYS.facilities);
       if (f) setFacilities(f);
       const cg = await safeGet(STORAGE_KEYS.clinicalGroups);
       if (cg) setClinicalGroups(cg);
 
-      // Try to restore faculty session from localStorage
-      const sessionId = safeLocal.get(LOCAL_KEYS.session);
-      if (sessionId && a) {
-        const acc = a.find(x => x.id === sessionId && !x.disabled);
-        if (acc) setAuth({ type: 'faculty', accountId: acc.id, name: acc.name, email: acc.email });
-      }
       setBooted(true);
     })();
   }, []);
@@ -185,9 +204,14 @@ export default function App() {
   const persistFacilities = async (next) => { setFacilities(next); await safeSet(STORAGE_KEYS.facilities, next); };
   const persistClinicalGroups = async (next) => { setClinicalGroups(next); await safeSet(STORAGE_KEYS.clinicalGroups, next); };
 
-  const signInFaculty = (account) => {
+  const signIn = (account) => {
     safeLocal.set(LOCAL_KEYS.session, account.id);
-    setAuth({ type: 'faculty', accountId: account.id, name: account.name, email: account.email });
+    setAuth({
+      accountId: account.id,
+      name: account.name,
+      email: account.email,
+      role: getRole(account),
+    });
   };
 
   const signOut = () => {
@@ -201,13 +225,14 @@ export default function App() {
       {!booted ? (
         <BootScreen />
       ) : auth === null ? (
-        <LoginScreen config={config} accounts={accounts}
+        <LoginScreen config={config} setConfig={persistConfig}
+                     accounts={accounts}
                      setAccounts={persistAccounts}
-                     onAdminAuth={() => setAuth('admin')}
-                     onFacultyAuth={signInFaculty}
+                     onSignIn={signIn}
                      showToast={showToast} />
-      ) : auth === 'admin' ? (
+      ) : isStaff(auth) ? (
         <AdminApp
+          me={auth}
           config={config} setConfig={persistConfig}
           cohorts={cohorts} students={students} setRoster={persistRoster}
           submissions={submissions} setSubmissions={persistSubs}
@@ -454,15 +479,15 @@ function Toast({ toast }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Login
 // ──────────────────────────────────────────────────────────────────────────────
-function LoginScreen({ config, accounts, setAccounts, onAdminAuth, onFacultyAuth, showToast }) {
-  const [mode, setMode] = useState('signin'); // 'signin' | 'register' | 'admin' | 'forgot'
+function LoginScreen({ config, setConfig, accounts, setAccounts, onSignIn, showToast }) {
+  const [mode, setMode] = useState('signin'); // 'signin' | 'register' | 'legacy' | 'forgot' | 'bootstrap'
 
   if (mode === 'register') {
     return <CreateAccountScreen
       config={config}
       accounts={accounts}
       setAccounts={setAccounts}
-      onCreated={onFacultyAuth}
+      onCreated={onSignIn}
       onCancel={() => setMode('signin')}
       showToast={showToast}
     />;
@@ -477,34 +502,38 @@ function LoginScreen({ config, accounts, setAccounts, onAdminAuth, onFacultyAuth
     />;
   }
 
+  if (mode === 'legacy') {
+    return <LegacyAdminScreen
+      config={config}
+      accounts={accounts}
+      setAccounts={setAccounts}
+      setConfig={setConfig}
+      onSignedIn={onSignIn}
+      onBack={() => setMode('signin')}
+      showToast={showToast}
+    />;
+  }
+
   return <SignInScreen
     mode={mode}
     setMode={setMode}
     config={config}
     accounts={accounts}
-    onAdminAuth={onAdminAuth}
-    onFacultyAuth={onFacultyAuth}
+    onSignIn={onSignIn}
   />;
 }
 
-function SignInScreen({ mode, setMode, config, accounts, onAdminAuth, onFacultyAuth }) {
+function SignInScreen({ mode, setMode, config, accounts, onSignIn }) {
   const [email, setEmail] = useState('');
   const [pwd, setPwd] = useState('');
   const [showPwd, setShowPwd] = useState(false);
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const isAdmin = mode === 'admin';
-
   const submit = async () => {
     setErr('');
     setBusy(true);
     try {
-      if (isAdmin) {
-        if (pwd.trim() === (config.adminPassword || '').trim()) onAdminAuth();
-        else setErr('Incorrect administrator password.');
-        return;
-      }
       const target = normalizeEmail(email);
       if (!target) { setErr('Enter your email.'); return; }
       const acc = accounts.find(a => normalizeEmail(a.email) === target);
@@ -512,11 +541,14 @@ function SignInScreen({ mode, setMode, config, accounts, onAdminAuth, onFacultyA
       if (acc.disabled) { setErr('This account has been disabled. Contact your administrator.'); return; }
       const hash = await hashPassword(pwd);
       if (hash !== acc.passwordHash) { setErr('Incorrect password.'); return; }
-      onFacultyAuth(acc);
+      onSignIn(acc);
     } finally {
       setBusy(false);
     }
   };
+
+  const hasOwner = accounts.some(a => isOwner(a) && !a.disabled);
+  const legacyAllowed = config.legacyAdminEnabled !== false && (!hasOwner || !!config.adminPassword);
 
   return (
     <div style={{ display: 'grid', placeItems: 'center', minHeight: '100vh', padding: 24 }}>
@@ -528,41 +560,36 @@ function SignInScreen({ mode, setMode, config, accounts, onAdminAuth, onFacultyA
             Clinical Weekly <span className="cwr-italic">Report</span>
           </h1>
           <p style={{ color: C.inkSoft, marginTop: 10, fontSize: 14 }}>
-            {isAdmin ? 'Administrator sign in' : 'Faculty reporting portal · Sign in to your account'}
+            Sign in to your account
           </p>
         </div>
 
         <div className="cwr-card" style={{ padding: 28 }}>
-          {!isAdmin && (
-            <>
-              <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: C.inkSoft }}>
-                Email
-              </label>
-              <input
-                autoFocus
-                type="email"
-                className="cwr-input"
-                value={email}
-                onChange={e => { setEmail(e.target.value); setErr(''); }}
-                onKeyDown={e => { if (e.key === 'Enter') submit(); }}
-                placeholder="you@cdrewu.edu"
-                style={{ marginBottom: 14 }}
-              />
-            </>
-          )}
+          <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: C.inkSoft }}>
+            Email
+          </label>
+          <input
+            autoFocus
+            type="email"
+            className="cwr-input"
+            value={email}
+            onChange={e => { setEmail(e.target.value); setErr(''); }}
+            onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+            placeholder="you@cdrewu.edu"
+            style={{ marginBottom: 14 }}
+          />
 
           <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: C.inkSoft }}>
             Password
           </label>
           <div style={{ position: 'relative' }}>
             <input
-              autoFocus={isAdmin}
               type={showPwd ? 'text' : 'password'}
               className="cwr-input"
               value={pwd}
               onChange={e => { setPwd(e.target.value); setErr(''); }}
               onKeyDown={e => { if (e.key === 'Enter') submit(); }}
-              placeholder={isAdmin ? 'Administrator password' : 'Your password'}
+              placeholder="Your password"
               style={{ paddingRight: 44 }}
             />
             <button type="button" onClick={() => setShowPwd(s => !s)}
@@ -583,45 +610,278 @@ function SignInScreen({ mode, setMode, config, accounts, onAdminAuth, onFacultyA
             <Lock size={16} /> Sign in
           </button>
 
-          {!isAdmin && (
-            <>
-              <div style={{ textAlign: 'right', marginTop: 8 }}>
-                <button onClick={() => setMode('forgot')}
-                        style={{ fontSize: 12, color: C.inkFaint, padding: 4,
-                                 textDecoration: 'underline', textUnderlineOffset: 2 }}>
-                  Forgot password?
-                </button>
-              </div>
-              <div style={{ marginTop: 12, paddingTop: 16, borderTop: `1px solid ${C.lineSoft}`,
-                            textAlign: 'center', fontSize: 13, color: C.inkSoft }}>
-                Don't have an account?{' '}
-                <button onClick={() => setMode('register')}
-                        style={{ color: C.forest, fontWeight: 500, padding: 0,
-                                 textDecoration: 'underline', textUnderlineOffset: 3 }}>
-                  Create one
-                </button>
-              </div>
-            </>
-          )}
+          <div style={{ textAlign: 'right', marginTop: 8 }}>
+            <button onClick={() => setMode('forgot')}
+                    style={{ fontSize: 12, color: C.inkFaint, padding: 4,
+                             textDecoration: 'underline', textUnderlineOffset: 2 }}>
+              Forgot password?
+            </button>
+          </div>
+          <div style={{ marginTop: 12, paddingTop: 16, borderTop: `1px solid ${C.lineSoft}`,
+                        textAlign: 'center', fontSize: 13, color: C.inkSoft }}>
+            Don't have an account?{' '}
+            <button onClick={() => setMode('register')}
+                    style={{ color: C.forest, fontWeight: 500, padding: 0,
+                             textDecoration: 'underline', textUnderlineOffset: 3 }}>
+              Create one
+            </button>
+          </div>
         </div>
 
-        <div style={{ textAlign: 'center', marginTop: 18 }}>
-          {isAdmin ? (
-            <button onClick={() => setMode('signin')}
+        {legacyAllowed && (
+          <div style={{ textAlign: 'center', marginTop: 18 }}>
+            <button onClick={() => setMode('legacy')}
                     style={{ fontSize: 13, color: C.inkFaint, padding: 4 }}>
-              ← Faculty sign in instead
+              {!hasOwner ? 'First-time setup? ' : 'Owner locked out? '}
+              <span style={{ color: C.inkSoft, textDecoration: 'underline', textUnderlineOffset: 2 }}>
+                Use legacy admin password
+              </span>
             </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LegacyAdminScreen({ config, accounts, setAccounts, setConfig, onSignedIn, onBack, showToast }) {
+  // Two stages:
+  //   step 1: enter shared admin password
+  //   step 2: bootstrap — either promote existing account to owner OR create a new owner
+  const [step, setStep] = useState('password');
+  const [pwd, setPwd] = useState('');
+  const [showPwd, setShowPwd] = useState(false);
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  // Bootstrap step state
+  const [mode, setMode] = useState('new'); // 'new' | 'promote'
+  // For 'new'
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [newPwd, setNewPwd] = useState('');
+  const [newPwd2, setNewPwd2] = useState('');
+  // For 'promote'
+  const [promoteId, setPromoteId] = useState('');
+
+  const hasOwner = accounts.some(a => isOwner(a) && !a.disabled);
+
+  const submitPassword = () => {
+    setErr('');
+    if (pwd.trim() !== (config.adminPassword || '').trim()) {
+      setErr('Incorrect admin password.');
+      return;
+    }
+    if (!hasOwner) {
+      // Force bootstrap: must create or promote an owner before continuing
+      setStep('bootstrap');
+    } else {
+      // Owner already exists — sign in as a transient "legacy admin"
+      // (acts like a one-time owner for this session)
+      onSignedIn({
+        id: 'legacy',
+        name: 'Legacy Admin',
+        email: '—',
+        role: 'owner',
+        passwordHash: '',
+      });
+    }
+  };
+
+  const submitBootstrap = async () => {
+    setErr('');
+    if (mode === 'promote') {
+      const target = accounts.find(a => a.id === promoteId);
+      if (!target) { setErr('Pick an account to promote.'); return; }
+      setBusy(true);
+      try {
+        const next = accounts.map(a => a.id === target.id ? { ...a, role: 'owner', disabled: false } : a);
+        await setAccounts(next);
+        const updated = next.find(a => a.id === target.id);
+        onSignedIn(updated);
+      } finally { setBusy(false); }
+      return;
+    }
+    // Create new owner
+    if (!name.trim())  { setErr('Enter the owner\u2019s full name.'); return; }
+    const e = normalizeEmail(email);
+    if (!e || !e.includes('@')) { setErr('Enter a valid email.'); return; }
+    if (accounts.some(a => normalizeEmail(a.email) === e)) {
+      setErr('An account already exists with that email — try promoting it instead.');
+      return;
+    }
+    if (newPwd.length < 6) { setErr('Password must be at least 6 characters.'); return; }
+    if (newPwd !== newPwd2) { setErr('Passwords do not match.'); return; }
+    setBusy(true);
+    try {
+      const passwordHash = await hashPassword(newPwd);
+      const account = {
+        id: 'acc_' + uid(),
+        email: e, passwordHash,
+        name: name.trim(),
+        role: 'owner',
+        createdAt: new Date().toISOString(),
+        disabled: false,
+      };
+      await setAccounts([...accounts, account]);
+      showToast('Owner account created');
+      onSignedIn(account);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ display: 'grid', placeItems: 'center', minHeight: '100vh', padding: 24 }}>
+      <div className="cwr-fade-in" style={{ width: '100%', maxWidth: 500 }}>
+        <div style={{ textAlign: 'center', marginBottom: 32 }}>
+          <img src={LOGO_URL} alt="CDU College of Nursing"
+               style={{ maxWidth: '100%', height: 56, objectFit: 'contain', marginBottom: 18 }} />
+          <h1 className="cwr-display" style={{ fontSize: 28, margin: 0, lineHeight: 1.1 }}>
+            {step === 'password'
+              ? <>Legacy <span className="cwr-italic">admin sign-in</span></>
+              : <>Set up your <span className="cwr-italic">first owner</span></>}
+          </h1>
+          <p style={{ color: C.inkSoft, marginTop: 8, fontSize: 14 }}>
+            {step === 'password'
+              ? 'Use the shared admin password to access the portal.'
+              : 'No Owner account exists yet. Promote an existing faculty member or create a fresh Owner account to continue.'}
+          </p>
+        </div>
+
+        <div className="cwr-card" style={{ padding: 26 }}>
+          {step === 'password' ? (
+            <>
+              <FieldLabel>Shared admin password</FieldLabel>
+              <div style={{ position: 'relative' }}>
+                <input className="cwr-input" autoFocus
+                       type={showPwd ? 'text' : 'password'}
+                       value={pwd}
+                       onChange={e => { setPwd(e.target.value); setErr(''); }}
+                       onKeyDown={e => { if (e.key === 'Enter') submitPassword(); }}
+                       placeholder="admin password"
+                       style={{ paddingRight: 44 }} />
+                <button type="button" onClick={() => setShowPwd(s => !s)}
+                        style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+                                 padding: 8, color: C.inkFaint }}>
+                  {showPwd ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              {err && (
+                <div style={{ marginTop: 12, color: C.rose, fontSize: 13, display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <AlertCircle size={14} /> {err}
+                </div>
+              )}
+              <button onClick={submitPassword} className="cwr-btn-primary"
+                      style={{ width: '100%', marginTop: 18, justifyContent: 'center' }}>
+                <Lock size={16} /> Continue
+              </button>
+              {!hasOwner && (
+                <div style={{ marginTop: 14, padding: 12, background: C.amber + '15',
+                              border: `1px solid ${C.amber}44`, borderRadius: 8, fontSize: 12, color: C.inkSoft }}>
+                  <strong>First-time setup:</strong> after you sign in, you'll be asked to create the
+                  first Owner account. After that, you and other admins will sign in with personal
+                  email/password.
+                </div>
+              )}
+            </>
           ) : (
-            <button onClick={() => setMode('admin')}
-                    style={{ fontSize: 13, color: C.inkFaint, padding: 4 }}>
-              Administrator? <span style={{ color: C.inkSoft, textDecoration: 'underline', textUnderlineOffset: 2 }}>Sign in here</span>
-            </button>
+            <>
+              {/* Bootstrap step */}
+              <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                <button onClick={() => setMode('new')}
+                        style={{
+                          flex: 1, padding: 12, borderRadius: 8, fontSize: 13,
+                          background: mode === 'new' ? C.ink : C.white,
+                          color:      mode === 'new' ? C.paper : C.inkSoft,
+                          border:    `1px solid ${mode === 'new' ? C.ink : C.line}`,
+                        }}>
+                  Create new Owner
+                </button>
+                <button onClick={() => setMode('promote')}
+                        disabled={accounts.length === 0}
+                        style={{
+                          flex: 1, padding: 12, borderRadius: 8, fontSize: 13,
+                          background: mode === 'promote' ? C.ink : C.white,
+                          color:      mode === 'promote' ? C.paper : C.inkSoft,
+                          border:    `1px solid ${mode === 'promote' ? C.ink : C.line}`,
+                          opacity: accounts.length === 0 ? 0.5 : 1,
+                        }}>
+                  Promote existing account
+                </button>
+              </div>
+
+              {mode === 'new' ? (
+                <>
+                  <FieldLabel>Full name</FieldLabel>
+                  <input className="cwr-input" autoFocus value={name}
+                         onChange={e => { setName(e.target.value); setErr(''); }}
+                         placeholder="e.g. Angelique Dodd" style={{ marginBottom: 12 }} />
+                  <FieldLabel>Email</FieldLabel>
+                  <input className="cwr-input" type="email" value={email}
+                         onChange={e => { setEmail(e.target.value); setErr(''); }}
+                         placeholder="you@cdrewu.edu" style={{ marginBottom: 12 }} />
+                  <FieldLabel>Password</FieldLabel>
+                  <input className="cwr-input" type={showPwd ? 'text' : 'password'}
+                         value={newPwd}
+                         onChange={e => { setNewPwd(e.target.value); setErr(''); }}
+                         placeholder="At least 6 characters" style={{ marginBottom: 10 }} />
+                  <input className="cwr-input" type={showPwd ? 'text' : 'password'}
+                         value={newPwd2}
+                         onChange={e => { setNewPwd2(e.target.value); setErr(''); }}
+                         onKeyDown={e => { if (e.key === 'Enter') submitBootstrap(); }}
+                         placeholder="Confirm password" />
+                </>
+              ) : (
+                <>
+                  <FieldLabel>Pick an account to promote to Owner</FieldLabel>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    {accounts.filter(a => !a.disabled).sort((x, y) => x.name.localeCompare(y.name)).map(a => {
+                      const picked = promoteId === a.id;
+                      return (
+                        <label key={a.id} className={'cwr-radio' + (picked ? ' selected' : '')}>
+                          <input type="radio" checked={picked}
+                                 onChange={() => setPromoteId(a.id)} />
+                          <span style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+                            <span style={{ fontWeight: 500 }}>{a.name}</span>
+                            <span style={{ fontSize: 12, color: C.inkFaint, marginTop: 2 }}>
+                              {a.email} · currently {roleLabel(getRole(a))}
+                            </span>
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <div style={{ marginTop: 10, fontSize: 12, color: C.inkFaint }}>
+                    The promoted account keeps its existing password and history; only the role changes.
+                  </div>
+                </>
+              )}
+
+              {err && (
+                <div style={{ marginTop: 12, color: C.rose, fontSize: 13, display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <AlertCircle size={14} /> {err}
+                </div>
+              )}
+
+              <button onClick={submitBootstrap} disabled={busy} className="cwr-btn-primary"
+                      style={{ width: '100%', marginTop: 18, justifyContent: 'center' }}>
+                <KeyRound size={16} /> {mode === 'new' ? 'Create Owner account' : 'Promote to Owner'}
+              </button>
+            </>
           )}
+
+          <div style={{ marginTop: 16, paddingTop: 14, borderTop: `1px solid ${C.lineSoft}`,
+                        textAlign: 'center', fontSize: 13 }}>
+            <button onClick={onBack}
+                    style={{ color: C.inkSoft, padding: 4 }}>
+              ← Back to sign in
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
+
 
 function CreateAccountScreen({ config, accounts, setAccounts, onCreated, onCancel, showToast }) {
   const [code, setCode] = useState('');
@@ -1747,12 +2007,20 @@ function Header({ onLogout, subtitle }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Admin app
 // ──────────────────────────────────────────────────────────────────────────────
-function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions, setSubmissions, accounts, setAccounts, facilities, setFacilities, clinicalGroups, setClinicalGroups, onLogout, showToast }) {
+function AdminApp({ me, config, setConfig, cohorts, students, setRoster, submissions, setSubmissions, accounts, setAccounts, facilities, setFacilities, clinicalGroups, setClinicalGroups, onLogout, showToast }) {
   const [tab, setTab] = useState('submissions');
+  const myRole = getRole(me);
+  const ownerOnly = isOwner(me);
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: '32px 24px 80px' }}>
-      <Header onLogout={onLogout} subtitle="Administrator console" />
+      <Header onLogout={onLogout}
+              subtitle={<>Administrator console · <span style={{
+                display: 'inline-block', padding: '2px 8px', borderRadius: 999,
+                fontSize: 11, fontWeight: 600, letterSpacing: '0.04em',
+                background: roleColor(myRole).bg, color: roleColor(myRole).fg,
+                marginLeft: 4,
+              }}>{roleLabel(myRole)}</span> · {me.name}</>} />
 
       <div className="cwr-no-print" style={{ display: 'flex', gap: 4, marginBottom: 28, padding: 4, background: C.paperAlt,
                     borderRadius: 10, alignSelf: 'flex-start', width: 'fit-content', flexWrap: 'wrap' }}>
@@ -1760,8 +2028,8 @@ function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions
                 icon={<FileText size={16} />} label="Submissions" count={submissions.length} />
         <TabBtn active={tab === 'rosters'} onClick={() => setTab('rosters')}
                 icon={<Users size={16} />} label="Cohorts & rosters" count={cohorts.length} />
-        <TabBtn active={tab === 'faculty'} onClick={() => setTab('faculty')}
-                icon={<GraduationCap size={16} />} label="Faculty accounts" count={accounts.length} />
+        <TabBtn active={tab === 'people'} onClick={() => setTab('people')}
+                icon={<GraduationCap size={16} />} label="People" count={accounts.length} />
         <TabBtn active={tab === 'facilities'} onClick={() => setTab('facilities')}
                 icon={<Building size={16} />} label="Facilities" count={facilities.length} />
         <TabBtn active={tab === 'settings'} onClick={() => setTab('settings')}
@@ -1778,15 +2046,16 @@ function AdminApp({ config, setConfig, cohorts, students, setRoster, submissions
                       facilities={facilities} accounts={accounts}
                       showToast={showToast} />
       )}
-      {tab === 'faculty' && (
-        <FacultyAccountsPanel accounts={accounts} setAccounts={setAccounts}
-                              submissions={submissions} showToast={showToast} />
+      {tab === 'people' && (
+        <PeoplePanel me={me} accounts={accounts} setAccounts={setAccounts}
+                     submissions={submissions} showToast={showToast} />
       )}
       {tab === 'facilities' && (
         <FacilitiesPanel facilities={facilities} setFacilities={setFacilities} showToast={showToast} />
       )}
       {tab === 'settings' && (
-        <SettingsPanel config={config} setConfig={setConfig} showToast={showToast} />
+        <SettingsPanel me={me} config={config} setConfig={setConfig}
+                       accounts={accounts} showToast={showToast} />
       )}
     </div>
   );
@@ -2915,12 +3184,17 @@ function StudentRow({ student, index, onRename, onRemove }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Faculty accounts panel
 // ──────────────────────────────────────────────────────────────────────────────
-function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast }) {
+function PeoplePanel({ me, accounts, setAccounts, submissions, showToast }) {
   const [query, setQuery] = useState('');
+  const [roleFilter, setRoleFilter] = useState('all'); // 'all' | 'faculty' | 'admin' | 'owner'
   const [showDisabled, setShowDisabled] = useState(false);
   const [resettingId, setResettingId] = useState(null);
   const [tempPwd, setTempPwd] = useState('');
   const [busy, setBusy] = useState(false);
+  const [inviting, setInviting] = useState(false);
+  const [invite, setInvite] = useState({ name: '', email: '', role: 'admin', password: '' });
+
+  const ownerActions = isOwner(me);
 
   const submissionCount = useMemo(() => {
     const map = {};
@@ -2930,9 +3204,14 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
     return map;
   }, [submissions]);
 
-  // Surface pending reset requests first
+  const ownerCount = useMemo(
+    () => accounts.filter(a => isOwner(a) && !a.disabled).length,
+    [accounts]
+  );
+
   const filtered = accounts
     .filter(a => showDisabled || !a.disabled)
+    .filter(a => roleFilter === 'all' ? true : getRole(a) === roleFilter)
     .filter(a => {
       if (!query) return true;
       const q = query.toLowerCase();
@@ -2941,14 +3220,31 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
     .sort((a, b) => {
       // Pending resets first
       if (!!b.resetRequestedAt !== !!a.resetRequestedAt) return b.resetRequestedAt ? 1 : -1;
+      // Then by role weight (owner > admin > faculty), then by name
+      const weight = { owner: 0, admin: 1, faculty: 2 };
+      const wa = weight[getRole(a)] ?? 2;
+      const wb = weight[getRole(b)] ?? 2;
+      if (wa !== wb) return wa - wb;
       return a.name.localeCompare(b.name);
     });
 
   const pendingResetCount = accounts.filter(a => a.resetRequestedAt && !a.disabled).length;
 
+  const counts = {
+    all:     accounts.filter(a => showDisabled || !a.disabled).length,
+    owner:   accounts.filter(a => isOwner(a)   && (showDisabled || !a.disabled)).length,
+    admin:   accounts.filter(a => isAdmin(a)   && (showDisabled || !a.disabled)).length,
+    faculty: accounts.filter(a => isFaculty(a) && (showDisabled || !a.disabled)).length,
+  };
+
   const toggleDisabled = async (id) => {
     const acc = accounts.find(a => a.id === id);
     if (!acc) return;
+    // Don't allow disabling the last active Owner
+    if (!acc.disabled && isOwner(acc) && ownerCount <= 1) {
+      showToast("Can't disable the last active Owner. Promote someone else to Owner first.", 'error');
+      return;
+    }
     if (!acc.disabled && !confirm(`Disable ${acc.name}? They will no longer be able to sign in until you re-enable.`)) return;
     await setAccounts(accounts.map(a => a.id === id ? { ...a, disabled: !a.disabled } : a));
     showToast(acc.disabled ? 'Account re-enabled' : 'Account disabled');
@@ -2957,9 +3253,35 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
   const remove = async (id) => {
     const acc = accounts.find(a => a.id === id);
     if (!acc) return;
+    if (isOwner(acc) && ownerCount <= 1) {
+      showToast("Can't delete the last active Owner. Promote someone else first.", 'error');
+      return;
+    }
+    if (acc.id === me.accountId) {
+      showToast("You can't delete your own account.", 'error');
+      return;
+    }
     if (!confirm(`Delete the account for ${acc.name}? Their past submissions will remain, but they will need to register again to log in. This cannot be undone.`)) return;
     await setAccounts(accounts.filter(a => a.id !== id));
     showToast('Account deleted');
+  };
+
+  const changeRole = async (id, newRole) => {
+    const acc = accounts.find(a => a.id === id);
+    if (!acc) return;
+    // Don't allow demoting the last active Owner
+    if (isOwner(acc) && newRole !== 'owner' && ownerCount <= 1) {
+      showToast("Can't demote the last active Owner. Promote someone else first.", 'error');
+      return;
+    }
+    const promotion = (getRole(acc) === 'faculty' && (newRole === 'admin' || newRole === 'owner'));
+    const demotion  = ((getRole(acc) === 'admin' || getRole(acc) === 'owner') && newRole === 'faculty');
+    let msg = `Change ${acc.name}'s role to ${roleLabel(newRole)}?`;
+    if (promotion) msg += `\n\nThey will gain administrator access on next sign-in.`;
+    if (demotion)  msg += `\n\nThey will lose administrator access on next sign-in.`;
+    if (!confirm(msg)) return;
+    await setAccounts(accounts.map(a => a.id === id ? { ...a, role: newRole } : a));
+    showToast(`Role updated to ${roleLabel(newRole)}`);
   };
 
   const startReset = (id) => {
@@ -2983,7 +3305,6 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
       delete updated.resetRequestedAt;
       await setAccounts(accounts.map(a => a.id === acc.id ? updated : a));
       showToast(`Password reset for ${acc.name}. Share the temp password with them.`);
-      // Keep the panel open so admin can copy the password
     } finally {
       setBusy(false);
     }
@@ -2998,17 +3319,113 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
     }
   };
 
+  const submitInvite = async () => {
+    if (!invite.name.trim()) { showToast('Enter a name', 'error'); return; }
+    const e = normalizeEmail(invite.email);
+    if (!e || !e.includes('@')) { showToast('Enter a valid email', 'error'); return; }
+    if (accounts.some(a => normalizeEmail(a.email) === e)) {
+      showToast('An account already exists with that email — change their role instead', 'error');
+      return;
+    }
+    if (!invite.password || invite.password.length < 6) {
+      showToast('Initial password must be at least 6 characters', 'error');
+      return;
+    }
+    setBusy(true);
+    try {
+      const passwordHash = await hashPassword(invite.password);
+      const account = {
+        id: 'acc_' + uid(),
+        email: e,
+        passwordHash,
+        name: invite.name.trim(),
+        role: invite.role,
+        createdAt: new Date().toISOString(),
+        disabled: false,
+      };
+      await setAccounts([...accounts, account]);
+      showToast(`${roleLabel(invite.role)} account created — share the password with them securely`);
+      setInvite({ name: '', email: '', role: 'admin', password: '' });
+      setInviting(false);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="cwr-fade-in">
-      <div style={{ marginBottom: 20 }}>
-        <h2 className="cwr-display" style={{ fontSize: 28, margin: 0 }}>
-          Faculty <span className="cwr-italic">accounts</span>
-        </h2>
-        <p style={{ color: C.inkSoft, fontSize: 13, marginTop: 6 }}>
-          {accounts.length} account{accounts.length === 1 ? '' : 's'} registered.
-          Faculty self-register using the registration code in Settings.
-        </p>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end',
+                    gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
+        <div>
+          <h2 className="cwr-display" style={{ fontSize: 28, margin: 0 }}>
+            People & <span className="cwr-italic">access</span>
+          </h2>
+          <p style={{ color: C.inkSoft, fontSize: 13, marginTop: 6 }}>
+            {accounts.length} account{accounts.length === 1 ? '' : 's'} registered.
+            Faculty self-register; Admins and Owners are created by an Owner below.
+          </p>
+        </div>
+        {ownerActions && !inviting && (
+          <button onClick={() => setInviting(true)} className="cwr-btn-primary"
+                  style={{ padding: '8px 12px', fontSize: 13 }}>
+            <UserPlus size={14} /> Invite admin
+          </button>
+        )}
       </div>
+
+      {inviting && (
+        <div className="cwr-card cwr-fade-in" style={{ marginBottom: 16, padding: 18 }}>
+          <h3 style={{ fontSize: 15, fontWeight: 600, marginTop: 0, marginBottom: 4 }}>
+            Create administrator account
+          </h3>
+          <p style={{ fontSize: 12, color: C.inkSoft, marginTop: 0, marginBottom: 14 }}>
+            Creates an account directly. Share the initial password with them securely
+            (Slack, phone, in person). They can change it after first sign-in.
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 10 }}>
+            <div>
+              <FieldLabel>Full name</FieldLabel>
+              <input className="cwr-input" value={invite.name} autoFocus
+                     onChange={e => setInvite({ ...invite, name: e.target.value })}
+                     placeholder="e.g. Angelique Dodd" />
+            </div>
+            <div>
+              <FieldLabel>Email</FieldLabel>
+              <input className="cwr-input" type="email" value={invite.email}
+                     onChange={e => setInvite({ ...invite, email: e.target.value })}
+                     placeholder="them@cdrewu.edu" />
+            </div>
+            <div>
+              <FieldLabel>Role</FieldLabel>
+              <select className="cwr-input" value={invite.role}
+                      onChange={e => setInvite({ ...invite, role: e.target.value })}>
+                <option value="admin">Administrator</option>
+                <option value="owner">Owner</option>
+              </select>
+            </div>
+            <div>
+              <FieldLabel>Initial password</FieldLabel>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <input className="cwr-input" type="text" value={invite.password}
+                       onChange={e => setInvite({ ...invite, password: e.target.value })}
+                       placeholder="At least 6 characters"
+                       style={{ fontFamily: 'ui-monospace, monospace' }} />
+                <button onClick={() => setInvite({ ...invite, password: genTempPassword() })}
+                        className="cwr-btn-ghost" style={{ padding: '9px 10px', fontSize: 13 }}>
+                  <RefreshCw size={13} />
+                </button>
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'flex', gap: 6, marginTop: 14, justifyContent: 'flex-end' }}>
+            <button onClick={() => { setInviting(false); setInvite({ name: '', email: '', role: 'admin', password: '' }); }}
+                    className="cwr-btn-ghost">Cancel</button>
+            <button onClick={submitInvite} disabled={busy} className="cwr-btn-primary">
+              <UserPlus size={14} /> Create account
+            </button>
+          </div>
+        </div>
+      )}
 
       {pendingResetCount > 0 && (
         <div style={{
@@ -3025,6 +3442,33 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
           </span>
         </div>
       )}
+
+      {/* Role filter chips */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 12, flexWrap: 'wrap' }}>
+        {[
+          { id: 'all',     label: 'All' },
+          { id: 'owner',   label: 'Owners' },
+          { id: 'admin',   label: 'Admins' },
+          { id: 'faculty', label: 'Faculty' },
+        ].map(f => {
+          const active = roleFilter === f.id;
+          return (
+            <button key={f.id} onClick={() => setRoleFilter(f.id)}
+                    style={{
+                      padding: '6px 12px', borderRadius: 999, fontSize: 13,
+                      background: active ? C.ink : C.white,
+                      color: active ? C.paper : C.inkSoft,
+                      border: `1px solid ${active ? C.ink : C.line}`,
+                      transition: 'all .12s',
+                    }}>
+              {f.label}
+              <span style={{ marginLeft: 6, opacity: 0.7, fontSize: 12 }}>
+                {counts[f.id]}
+              </span>
+            </button>
+          );
+        })}
+      </div>
 
       <div style={{ display: 'flex', gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
         <div style={{ position: 'relative', flex: 1, minWidth: 220 }}>
@@ -3048,12 +3492,14 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
                     body="Share your faculty registration code (in Settings) so clinical instructors can create their own accounts." />
       ) : filtered.length === 0 ? (
         <EmptyState icon={<Search size={32} />} title="No matches"
-                    body="Try a different search or toggle 'Show disabled'." />
+                    body="Try a different search, role filter, or toggle 'Show disabled'." />
       ) : (
         <div className="cwr-card" style={{ padding: 0, overflow: 'hidden' }}>
           {filtered.map((a, i) => {
             const pending = !!a.resetRequestedAt;
             const isResetting = resettingId === a.id;
+            const role = getRole(a);
+            const isSelf = a.id === me.accountId;
             return (
               <div key={a.id} style={{
                 borderBottom: i < filtered.length - 1 ? `1px solid ${C.lineSoft}` : 'none',
@@ -3073,6 +3519,13 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
                   <div style={{ flex: 1, minWidth: 180 }}>
                     <div style={{ fontWeight: 500, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                       {a.name}
+                      {isSelf && <span className="cwr-chip" style={{
+                        background: C.forest + '22', color: C.forest, borderColor: 'transparent',
+                      }}>You</span>}
+                      <span className="cwr-chip" style={{
+                        background: roleColor(role).bg, color: roleColor(role).fg,
+                        borderColor: roleColor(role).bd,
+                      }}>{roleLabel(role)}</span>
                       {a.disabled && <span className="cwr-chip" style={{
                         background: C.rose + '22', color: C.rose, borderColor: 'transparent',
                       }}>Disabled</span>}
@@ -3090,7 +3543,17 @@ function FacultyAccountsPanel({ accounts, setAccounts, submissions, showToast })
                     {submissionCount[a.id] || 0} report{submissionCount[a.id] === 1 ? '' : 's'}
                     <div style={{ marginTop: 2 }}>Joined {fmtDate(a.createdAt)}</div>
                   </div>
-                  <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', alignItems: 'center' }}>
+                    {ownerActions && (
+                      <select className="cwr-input"
+                              value={role}
+                              onChange={e => changeRole(a.id, e.target.value)}
+                              style={{ padding: '6px 10px', fontSize: 13, height: 'auto', minWidth: 130 }}>
+                        <option value="faculty">Faculty</option>
+                        <option value="admin">Administrator</option>
+                        <option value="owner">Owner</option>
+                      </select>
+                    )}
                     <button onClick={() => startReset(a.id)}
                             className={pending ? 'cwr-btn-primary' : 'cwr-btn-ghost'}
                             style={{ padding: '6px 10px', fontSize: 13 }}>
@@ -3281,21 +3744,33 @@ function FacilitiesPanel({ facilities, setFacilities, showToast }) {
 // ──────────────────────────────────────────────────────────────────────────────
 // Settings panel
 // ──────────────────────────────────────────────────────────────────────────────
-function SettingsPanel({ config, setConfig, showToast }) {
+function SettingsPanel({ me, config, setConfig, accounts, showToast }) {
   const [adminPwd, setAdminPwd] = useState(config.adminPassword);
   const [facultyPwd, setFacultyPwd] = useState(config.facultyPassword);
   const [showAdmin, setShowAdmin] = useState(false);
   const [showFac, setShowFac] = useState(false);
 
+  const ownerView = isOwner(me);
+  const legacyEnabled = config.legacyAdminEnabled !== false;
+  const hasOwner = accounts.some(a => isOwner(a) && !a.disabled);
+
   const saveAdmin = async () => {
     if (!adminPwd) { showToast('Password cannot be empty', 'error'); return; }
     await setConfig({ ...config, adminPassword: adminPwd });
-    showToast('Admin password updated');
+    showToast('Legacy admin password updated');
   };
   const saveFaculty = async () => {
     if (!facultyPwd) { showToast('Code cannot be empty', 'error'); return; }
     await setConfig({ ...config, facultyPassword: facultyPwd });
     showToast('Registration code updated');
+  };
+  const toggleLegacy = async () => {
+    if (legacyEnabled && !hasOwner) {
+      showToast('Create an Owner account before disabling the legacy password — otherwise no one can sign in as admin.', 'error');
+      return;
+    }
+    await setConfig({ ...config, legacyAdminEnabled: !legacyEnabled });
+    showToast(legacyEnabled ? 'Legacy admin password disabled' : 'Legacy admin password enabled');
   };
 
   return (
@@ -3305,7 +3780,7 @@ function SettingsPanel({ config, setConfig, showToast }) {
       </h2>
       <p style={{ color: C.inkSoft, fontSize: 14, marginBottom: 24 }}>
         Manage the credentials used to access the portal. Faculty create their own accounts using
-        the registration code below.
+        the registration code below. Admins and Owners are managed in the People tab.
       </p>
 
       <div className="cwr-card" style={{ marginBottom: 16 }}>
@@ -3331,31 +3806,57 @@ function SettingsPanel({ config, setConfig, showToast }) {
         </div>
       </div>
 
-      <div className="cwr-card" style={{ marginBottom: 16 }}>
-        <h3 className="cwr-display" style={{ fontSize: 18, margin: 0, marginBottom: 4 }}>Administrator password</h3>
-        <p style={{ color: C.inkSoft, fontSize: 13, marginBottom: 14 }}>
-          For program directors managing rosters and submissions. Keep this private.
-        </p>
-        <div style={{ display: 'flex', gap: 8 }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <input className="cwr-input" type={showAdmin ? 'text' : 'password'}
-                   value={adminPwd} onChange={e => setAdminPwd(e.target.value)}
-                   style={{ paddingRight: 40 }} />
-            <button onClick={() => setShowAdmin(s => !s)}
-                    style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
-                             padding: 8, color: C.inkFaint }}>
-              {showAdmin ? <EyeOff size={16} /> : <Eye size={16} />}
+      {ownerView && (
+        <div className="cwr-card" style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+                        gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <h3 className="cwr-display" style={{ fontSize: 18, margin: 0, marginBottom: 4 }}>
+                Legacy admin password
+                <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 600, letterSpacing: '0.06em',
+                               textTransform: 'uppercase', color: C.inkFaint }}>Deprecated</span>
+              </h3>
+              <p style={{ color: C.inkSoft, fontSize: 13, margin: 0 }}>
+                Shared password for emergency admin access when no Owner can sign in. Recommended:
+                keep enabled but rotate periodically. All routine admin work should go through personal accounts.
+              </p>
+            </div>
+            <button onClick={toggleLegacy}
+                    className={legacyEnabled ? 'cwr-btn-ghost' : 'cwr-btn-primary'}
+                    style={{ flexShrink: 0 }}>
+              {legacyEnabled ? 'Disable' : 'Enable'}
             </button>
           </div>
-          <button onClick={saveAdmin} disabled={adminPwd === config.adminPassword} className="cwr-btn-primary">
-            <Save size={15} /> Update
-          </button>
+
+          {legacyEnabled && (
+            <div style={{ display: 'flex', gap: 8 }}>
+              <div style={{ position: 'relative', flex: 1 }}>
+                <input className="cwr-input" type={showAdmin ? 'text' : 'password'}
+                       value={adminPwd} onChange={e => setAdminPwd(e.target.value)}
+                       style={{ paddingRight: 40 }} />
+                <button onClick={() => setShowAdmin(s => !s)}
+                        style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)',
+                                 padding: 8, color: C.inkFaint }}>
+                  {showAdmin ? <EyeOff size={16} /> : <Eye size={16} />}
+                </button>
+              </div>
+              <button onClick={saveAdmin} disabled={adminPwd === config.adminPassword} className="cwr-btn-primary">
+                <Save size={15} /> Update
+              </button>
+            </div>
+          )}
         </div>
-      </div>
+      )}
+
+      {!ownerView && (
+        <div style={{ padding: 14, background: C.paperAlt, borderRadius: 10, fontSize: 13, color: C.inkSoft, marginBottom: 16 }}>
+          The legacy admin password is managed by Owners only.
+        </div>
+      )}
 
       <div style={{ padding: 16, background: C.amber + '15', border: `1px solid ${C.amber}44`,
                     borderRadius: 10, fontSize: 13, color: C.inkSoft }}>
-        <strong style={{ color: C.ink }}>Default credentials:</strong> Admin password
+        <strong style={{ color: C.ink }}>Default credentials:</strong> Legacy admin password
         is <span className="cwr-mono">{DEFAULTS.adminPassword}</span>; the default faculty registration
         code is <span className="cwr-mono">{DEFAULTS.facultyPassword}</span>. Change both before sharing
         the link with clinical instructors.
