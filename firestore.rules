@@ -1,0 +1,21 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Clinical Weekly Report — Firestore security rules
+// ─────────────────────────────────────────────────────────────────────────────
+// Paste this into your Firebase console:
+//   Firestore Database → Rules tab → replace all content → Publish
+// ─────────────────────────────────────────────────────────────────────────────
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // PILOT POLICY: allow anyone with the API key to read & write.
+    // The faculty password gate in the app is the only access control here.
+    // This is fine for a closed pilot, but BEFORE production rollout to many
+    // users, replace this with Firebase Auth + per-role rules.
+    // See README → "Hardening".
+    match /kv_store/{key} {
+      allow read, write: if true;
+    }
+  }
+}
